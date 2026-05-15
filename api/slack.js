@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import { WebClient } from '@slack/web-api';
+import { waitUntil } from '@vercel/functions';
 import {
   handleAppMentionEvent,
   handleMessageEvent,
@@ -82,20 +83,21 @@ export default async function handler(req, res) {
     }
 
     if (payload.type === 'event_callback') {
-      res.status(200).end();
-
       const event = payload.event;
-      try {
-        if (event.type === 'app_mention') {
-          await handleAppMentionEvent({ event, slackClient: slack });
-        } else if (event.type === 'message') {
-          const botUserId = await getBotUserId();
-          await handleMessageEvent({ event, slackClient: slack, botUserId });
+      const work = (async () => {
+        try {
+          if (event.type === 'app_mention') {
+            await handleAppMentionEvent({ event, slackClient: slack });
+          } else if (event.type === 'message') {
+            const botUserId = await getBotUserId();
+            await handleMessageEvent({ event, slackClient: slack, botUserId });
+          }
+        } catch (err) {
+          console.error(`Handler error for ${event.type}:`, err);
         }
-      } catch (err) {
-        console.error(`Handler error for ${event.type}:`, err);
-      }
-      return;
+      })();
+      waitUntil(work);
+      return res.status(200).end();
     }
 
     return res.status(200).json({ ok: true });
@@ -110,20 +112,17 @@ export default async function handler(req, res) {
     const command = params.get('command');
 
     if (command === '/standup-now') {
-      res.status(200).json({
+      const work = postStandup({
+        slackClient: slack,
+        channelId: process.env.STANDUP_CHANNEL_ID,
+      }).catch((err) => {
+        console.error('Standup failed:', err);
+      });
+      waitUntil(work);
+      return res.status(200).json({
         response_type: 'ephemeral',
         text: 'Triggering a standup now — Peter is warming up...',
       });
-
-      try {
-        await postStandup({
-          slackClient: slack,
-          channelId: process.env.STANDUP_CHANNEL_ID,
-        });
-      } catch (err) {
-        console.error('Standup failed:', err);
-      }
-      return;
     }
 
     return res.status(200).json({
