@@ -135,6 +135,86 @@ function buildSlackThreadUrl(channel, threadTs) {
   return `https://slack.com/archives/${channel}/p${threadTs.replace('.', '')}`;
 }
 
+export async function handleAppMentionEvent({ event, slackClient }) {
+  await slackClient.chat.postMessage({
+    channel: event.channel,
+    text: `I hear you, <@${event.user}>. Type \`/standup-now\` to trigger a manual standup.`,
+  });
+}
+
+export async function handleMessageEvent({ event, slackClient, botUserId }) {
+  console.log('[msg event]', {
+    channel: event.channel,
+    thread_ts: event.thread_ts || null,
+    user: event.user,
+    subtype: event.subtype || 'none',
+    textPreview: (event.text || '').slice(0, 60),
+  });
+
+  if (event.channel !== process.env.STANDUP_CHANNEL_ID) {
+    console.log('  -> skipped: wrong channel');
+    return;
+  }
+  if (!event.thread_ts) {
+    console.log('  -> skipped: not a thread reply');
+    return;
+  }
+  if (event.user === botUserId) {
+    console.log('  -> skipped: bot itself');
+    return;
+  }
+  if (event.subtype) {
+    console.log(`  -> skipped: subtype=${event.subtype}`);
+    return;
+  }
+  if (!event.text || event.text.trim().length < 8) {
+    console.log('  -> skipped: too short');
+    return;
+  }
+
+  console.log(`Classifying reply from ${event.user}: ${event.text.slice(0, 60)}...`);
+
+  let parsed;
+  try {
+    parsed = await classifyReply(event.text);
+  } catch (err) {
+    console.error('Classifier API error:', err.message);
+    return;
+  }
+
+  if (!parsed || !parsed.is_decision) {
+    console.log('Not a decision. Skipping.');
+    return;
+  }
+
+  console.log(`Decision detected: ${parsed.summary}`);
+
+  const threadUrl = buildSlackThreadUrl(event.channel, event.thread_ts);
+
+  try {
+    const pr = await openDecisionPR({
+      summary: parsed.summary,
+      slug: parsed.topic_slug,
+      sourceText: event.text,
+      threadUrl,
+    });
+
+    await slackClient.chat.postMessage({
+      channel: event.channel,
+      thread_ts: event.thread_ts,
+      text: `I captured this as a decision and opened ${pr.html_url} for review.`,
+    });
+    console.log(`Opened PR #${pr.number}: ${pr.html_url}`);
+  } catch (err) {
+    console.error('Failed to open PR:', err.message);
+    await slackClient.chat.postMessage({
+      channel: event.channel,
+      thread_ts: event.thread_ts,
+      text: `I detected a decision here but couldn't open a PR: ${err.message}`,
+    });
+  }
+}
+
 export function registerHandlers(app, { botUserIdRef }) {
   app.command('/standup-now', async ({ ack, respond }) => {
     await ack();
@@ -156,82 +236,15 @@ export function registerHandlers(app, { botUserIdRef }) {
     }
   });
 
-  app.event('app_mention', async ({ event, say }) => {
-    await say(
-      `I hear you, <@${event.user}>. Type \`/standup-now\` to trigger a manual standup.`,
-    );
+  app.event('app_mention', async ({ event }) => {
+    await handleAppMentionEvent({ event, slackClient: app.client });
   });
 
   app.event('message', async ({ event }) => {
-    console.log('[msg event]', {
-      channel: event.channel,
-      thread_ts: event.thread_ts || null,
-      user: event.user,
-      subtype: event.subtype || 'none',
-      textPreview: (event.text || '').slice(0, 60),
+    await handleMessageEvent({
+      event,
+      slackClient: app.client,
+      botUserId: botUserIdRef.id,
     });
-
-    if (event.channel !== process.env.STANDUP_CHANNEL_ID) {
-      console.log('  -> skipped: wrong channel');
-      return;
-    }
-    if (!event.thread_ts) {
-      console.log('  -> skipped: not a thread reply');
-      return;
-    }
-    if (event.user === botUserIdRef.id) {
-      console.log('  -> skipped: bot itself');
-      return;
-    }
-    if (event.subtype) {
-      console.log(`  -> skipped: subtype=${event.subtype}`);
-      return;
-    }
-    if (!event.text || event.text.trim().length < 8) {
-      console.log('  -> skipped: too short');
-      return;
-    }
-
-    console.log(`Classifying reply from ${event.user}: ${event.text.slice(0, 60)}...`);
-
-    let parsed;
-    try {
-      parsed = await classifyReply(event.text);
-    } catch (err) {
-      console.error('Classifier API error:', err.message);
-      return;
-    }
-
-    if (!parsed || !parsed.is_decision) {
-      console.log('Not a decision. Skipping.');
-      return;
-    }
-
-    console.log(`Decision detected: ${parsed.summary}`);
-
-    const threadUrl = buildSlackThreadUrl(event.channel, event.thread_ts);
-
-    try {
-      const pr = await openDecisionPR({
-        summary: parsed.summary,
-        slug: parsed.topic_slug,
-        sourceText: event.text,
-        threadUrl,
-      });
-
-      await app.client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: event.thread_ts,
-        text: `I captured this as a decision and opened ${pr.html_url} for review.`,
-      });
-      console.log(`Opened PR #${pr.number}: ${pr.html_url}`);
-    } catch (err) {
-      console.error('Failed to open PR:', err.message);
-      await app.client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: event.thread_ts,
-        text: `I detected a decision here but couldn't open a PR: ${err.message}`,
-      });
-    }
   });
 }
